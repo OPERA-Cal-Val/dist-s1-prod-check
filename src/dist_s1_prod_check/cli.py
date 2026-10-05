@@ -13,6 +13,8 @@ from dist_s1_prod_check.constants import (
     RTC_S1_PARQUET,
     TAGS_PARQUET,
     TARGET_TILES_FILE,
+    VENUES,
+    VENUE_FILE,
     VERTEX_SEARCH_URL,
 )
 
@@ -121,6 +123,25 @@ def _write_outputs(
 
 data_dir_option = click.option('--data-dir', type=click.Path(path_type=Path), default=Path('data'), show_default=True)
 out_dir_option = click.option('--out-dir', type=click.Path(path_type=Path), default=Path('outputs'), show_default=True)
+venue_option = click.option(
+    '--venue',
+    type=click.Choice(VENUES, case_sensitive=False),
+    default='PROD',
+    show_default=True,
+    callback=lambda ctx, param, value: value.upper(),
+    help='ASF/CMR venue of the DIST-S1 products (RTC-S1 inputs always come from PROD).',
+)
+
+
+def _check_venue(data_dir: Path, venue: str) -> None:
+    """Refuse to reuse a data dir whose cached tables came from another venue (PROD/UAT product ids can collide)."""
+    marker = data_dir / VENUE_FILE
+    has_cache = any((data_dir / name).exists() for name in (DIST_S1_PARQUET, TAGS_PARQUET, INPUTS_CHECKPOINT_PARQUET))
+    cached = marker.read_text().strip() if marker.exists() else ('PROD' if has_cache else venue)
+    if cached != venue:
+        raise click.ClickException(f'{data_dir} holds {cached} data; use a separate --data-dir for {venue}.')
+    data_dir.mkdir(parents=True, exist_ok=True)
+    marker.write_text(f'{venue}\n')
 
 
 @click.group()
@@ -138,18 +159,29 @@ def cli() -> None:
 @click.option('--skip-rtc', is_flag=True, help='Only fetch DIST-S1 metadata.')
 @click.option('--chunk-days', type=int, default=2, show_default=True)
 @click.option('--workers', type=int, default=8, show_default=True)
+@venue_option
 @data_dir_option
 def download_metadata(
-    start: str, stop: str, bbox: tuple, lookback: bool, skip_rtc: bool, chunk_days: int, workers: int, data_dir: Path
+    start: str,
+    stop: str,
+    bbox: tuple,
+    lookback: bool,
+    skip_rtc: bool,
+    chunk_days: int,
+    workers: int,
+    venue: str,
+    data_dir: Path,
 ) -> None:
     """Download DIST-S1 and RTC-S1 granule metadata from CMR into geoparquet tables (check 1)."""
     from dist_s1_prod_check import cmr
 
-    data_dir.mkdir(parents=True, exist_ok=True)
+    _check_venue(data_dir, venue)
     bbox = tuple(bbox) if bbox else None
     dist_bbox, rtc_bbox = _resolve_bboxes(bbox, data_dir)
 
-    df_dist = cmr.get_dist_s1_table(start, stop, bbox=dist_bbox, chunk_days=max(chunk_days, 7), max_workers=workers)
+    df_dist = cmr.get_dist_s1_table(
+        start, stop, bbox=dist_bbox, chunk_days=max(chunk_days, 7), max_workers=workers, venue=venue
+    )
     df_dist.to_parquet(data_dir / DIST_S1_PARQUET, compression='zstd')
     click.echo(f'DIST-S1: {len(df_dist)} granules -> {data_dir / DIST_S1_PARQUET}')
 
@@ -497,6 +529,7 @@ def check_coverage(start: str, stop: str, data_dir: Path, out_dir: Path) -> None
 @click.option('--seed', type=int, default=42, show_default=True)
 @click.option('--expect-none-at-start', is_flag=True)
 @click.option('--refresh', is_flag=True, help='Re-download metadata tables even if present.')
+@venue_option
 @data_dir_option
 @out_dir_option
 def run_all(
@@ -511,6 +544,7 @@ def run_all(
     seed: int,
     expect_none_at_start: bool,
     refresh: bool,
+    venue: str,
     data_dir: Path,
     out_dir: Path,
 ) -> None:
@@ -518,14 +552,14 @@ def run_all(
     from dist_s1_prod_check import cmr
 
     stamp = _stamp()
-    data_dir.mkdir(parents=True, exist_ok=True)
+    _check_venue(data_dir, venue)
     bbox = tuple(bbox) if bbox else None
 
     refresh_meta = refresh or not (data_dir / DIST_S1_PARQUET).exists() or not (data_dir / RTC_S1_PARQUET).exists()
     if refresh_meta:
         (data_dir / INPUTS_CHECKPOINT_PARQUET).unlink(missing_ok=True)
         dist_bbox, rtc_bbox = _resolve_bboxes(bbox, data_dir)
-        df_dist = cmr.get_dist_s1_table(start, stop, bbox=dist_bbox, max_workers=cmr_workers)
+        df_dist = cmr.get_dist_s1_table(start, stop, bbox=dist_bbox, max_workers=cmr_workers, venue=venue)
         df_dist.to_parquet(data_dir / DIST_S1_PARQUET, compression='zstd')
         df_rtc = cmr.get_rtc_s1_table_with_lookback(start, stop, bbox=rtc_bbox, max_workers=cmr_workers)
         df_rtc.to_parquet(data_dir / RTC_S1_PARQUET, compression='zstd')
@@ -555,6 +589,7 @@ def run_all(
         f'{start} to {stop}'
         + (f' over {bbox}' if bbox else ' (global)')
         + (f' - sample of {sample_tiles} tiles' if sample_tiles else '')
+        + (f' - {venue} venue' if venue != 'PROD' else '')
         + f' - CMR metadata pulled {_pulled_at(data_dir)}'
     )
     title = f'DIST-S1 Production Check {pd.Timestamp(stamp):%Y-%m-%d}'

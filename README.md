@@ -58,6 +58,18 @@ Over an AOI instead:
 dist-s1-prod-check run-all --start 2026-01-01 --stop 2026-03-01 --bbox -120 34 -118 36
 ```
 
+**UAT venue** (DIST-S1 products delivered to ASF UAT, e.g. from a test-venue replay):
+
+```bash
+dist-s1-prod-check run-all --venue UAT --start 2026-01-01 --stop 2026-03-01 \
+    --data-dir data_uat --out-dir outputs_uat
+```
+
+Only DIST-S1 metadata and GeoTIFF tags come from UAT; RTC-S1 inputs are still read from PROD CMR.
+Requires a `machine uat.urs.earthdata.nasa.gov` entry in `~/.netrc`. Each data dir is tied to one venue
+(`venue.txt`), since PROD and UAT can hold products with the same ids. If the UAT run did not cover the
+whole globe, pass `--bbox` so the coverage check does not flag every unprocessed tile.
+
 **Fast iteration on a sample** (reuses all serialized data; seconds-to-minutes per run):
 
 ```bash

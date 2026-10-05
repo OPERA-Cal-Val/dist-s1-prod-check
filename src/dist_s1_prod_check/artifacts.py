@@ -17,10 +17,11 @@ def get_products_over_aoi(
     start_time: str | pd.Timestamp | None = None,
     stop_time: str | pd.Timestamp | None = None,
     df_dist: gpd.GeoDataFrame | None = None,
+    venue: str = 'PROD',
 ) -> gpd.GeoDataFrame:
     """Get DIST-S1 products over a lon/lat bbox, from a local table if provided, otherwise from CMR."""
     if df_dist is None:
-        return get_dist_s1_table(start_time, stop_time, bbox=bbox)
+        return get_dist_s1_table(start_time, stop_time, bbox=bbox, venue=venue)
     aoi = box(*bbox)
     df = df_dist[df_dist.intersects(aoi)]
     if start_time is not None:

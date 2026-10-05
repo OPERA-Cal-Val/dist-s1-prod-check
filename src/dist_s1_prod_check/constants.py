@@ -3,6 +3,13 @@ RTC_S1_CONCEPT_ID = 'C2777436413-ASF'
 CMR_GRANULES_URL = 'https://cmr.earthdata.nasa.gov/search/granules.umm_json'
 CMR_PAGE_SIZE = 2000
 
+# DIST-S1 products can be checked in ASF's PROD or UAT venue. RTC-S1 inputs are always read from PROD CMR,
+# since the UAT test venue consumes the operational RTC-S1 record.
+VENUES = ('PROD', 'UAT')
+DIST_S1_CONCEPT_IDS = {'PROD': DIST_S1_CONCEPT_ID, 'UAT': 'C1275699127-ASF'}
+CMR_GRANULES_URLS = {'PROD': CMR_GRANULES_URL, 'UAT': 'https://cmr.uat.earthdata.nasa.gov/search/granules.umm_json'}
+VENUE_FILE = 'venue.txt'
+
 LAYER_URL_MAP = {
     'alert_url': 'GEN-DIST-STATUS',
     'metric_url': 'GEN-METRIC',
