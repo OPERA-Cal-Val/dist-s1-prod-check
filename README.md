@@ -43,7 +43,8 @@ nohup dist-s1-prod-check run-all --start 2026-01-01 --stop 2026-03-01 \
     --data-dir data --out-dir outputs > run_all.log 2>&1 &
 ```
 
-Everything heavy is resumable: metadata tables are only re-downloaded with `--refresh`, tag
+Everything heavy is resumable: metadata tables are only re-downloaded with `--refresh` (the RTC-S1
+download also checkpoints each CMR chunk to `data/rtc_s1_chunks/` until the table is written), tag
 fetching (one DAAC read per product, ~230k globally) caches to `data/dist_s1_tags.parquet`, and
 the offline inputs check checkpoints per tile to `data/inputs_check_results.parquet` — a rerun
 of the same command picks up where it left off. The inputs check runs in `--inputs-workers`
@@ -62,8 +63,12 @@ dist-s1-prod-check run-all --start 2026-01-01 --stop 2026-03-01 --bbox -120 34 -
 
 ```bash
 dist-s1-prod-check run-all --venue UAT --start 2026-01-01 --stop 2026-03-01 \
-    --data-dir data_uat --out-dir outputs_uat
+    --processing-start 2026-09-24 --data-dir data_uat --out-dir outputs_uat
 ```
+
+A venue can hold several processing campaigns of the same acquisitions (older ones are not deleted).
+`--processing-start` / `--processing-stop` restrict every check to products processed in that range;
+otherwise de-duplication keeps the latest product per tile/acquisition across campaigns.
 
 Only DIST-S1 metadata and GeoTIFF tags come from UAT; RTC-S1 inputs are still read from PROD CMR.
 Requires a `machine uat.urs.earthdata.nasa.gov` entry in `~/.netrc`. Each data dir is tied to one venue

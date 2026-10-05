@@ -1,3 +1,4 @@
+import shutil
 from pathlib import Path
 
 import click
@@ -10,6 +11,7 @@ from dist_s1_prod_check.constants import (
     DELTA_WINDOW_DAYS,
     DIST_S1_PARQUET,
     INPUTS_CHECKPOINT_PARQUET,
+    RTC_CHUNKS_DIR,
     RTC_S1_PARQUET,
     TAGS_PARQUET,
     TARGET_TILES_FILE,
@@ -133,6 +135,29 @@ venue_option = click.option(
 )
 
 
+def _rtc_chunks_dir(data_dir: Path, rtc_bbox: tuple | None) -> Path:
+    suffix = '_' + '_'.join(f'{v:g}' for v in rtc_bbox) if rtc_bbox else ''
+    return data_dir / f'{RTC_CHUNKS_DIR}{suffix}'
+
+
+def _write_rtc(df_rtc: gpd.GeoDataFrame, data_dir: Path, chunks_dir: Path) -> None:
+    df_rtc.to_parquet(data_dir / RTC_S1_PARQUET, compression='zstd')
+    shutil.rmtree(chunks_dir, ignore_errors=True)
+
+
+def _filter_processing_time(
+    df_dist: gpd.GeoDataFrame, processing_start: str | None, processing_stop: str | None
+) -> gpd.GeoDataFrame:
+    """Keep products processed in [processing_start, processing_stop), e.g. one campaign in a venue holding several."""
+    keep = pd.Series(True, index=df_dist.index)
+    if processing_start:
+        keep &= df_dist.processing_time >= pd.Timestamp(processing_start)
+    if processing_stop:
+        keep &= df_dist.processing_time < pd.Timestamp(processing_stop)
+    click.echo(f'Processing-time filter kept {int(keep.sum())} of {len(df_dist)} DIST-S1 products')
+    return df_dist[keep].reset_index(drop=True)
+
+
 def _check_venue(data_dir: Path, venue: str) -> None:
     """Refuse to reuse a data dir whose cached tables came from another venue (PROD/UAT product ids can collide)."""
     marker = data_dir / VENUE_FILE
@@ -187,13 +212,16 @@ def download_metadata(
 
     if skip_rtc:
         return
+    chunks_dir = _rtc_chunks_dir(data_dir, rtc_bbox)
     if lookback:
         df_rtc = cmr.get_rtc_s1_table_with_lookback(
-            start, stop, bbox=rtc_bbox, chunk_days=chunk_days, max_workers=workers
+            start, stop, bbox=rtc_bbox, chunk_days=chunk_days, max_workers=workers, cache_dir=chunks_dir
         )
     else:
-        df_rtc = cmr.get_rtc_s1_table(start, stop, bbox=rtc_bbox, chunk_days=chunk_days, max_workers=workers)
-    df_rtc.to_parquet(data_dir / RTC_S1_PARQUET, compression='zstd')
+        df_rtc = cmr.get_rtc_s1_table(
+            start, stop, bbox=rtc_bbox, chunk_days=chunk_days, max_workers=workers, cache_dir=chunks_dir
+        )
+    _write_rtc(df_rtc, data_dir, chunks_dir)
     click.echo(f'RTC-S1: {len(df_rtc)} granules -> {data_dir / RTC_S1_PARQUET}')
 
 
@@ -529,6 +557,12 @@ def check_coverage(start: str, stop: str, data_dir: Path, out_dir: Path) -> None
 @click.option('--seed', type=int, default=42, show_default=True)
 @click.option('--expect-none-at-start', is_flag=True)
 @click.option('--refresh', is_flag=True, help='Re-download metadata tables even if present.')
+@click.option(
+    '--processing-start',
+    default=None,
+    help='Only check DIST-S1 products processed at or after this time, e.g. 2026-09-24 (isolates one campaign).',
+)
+@click.option('--processing-stop', default=None, help='Only check DIST-S1 products processed before this time.')
 @venue_option
 @data_dir_option
 @out_dir_option
@@ -544,6 +578,8 @@ def run_all(
     seed: int,
     expect_none_at_start: bool,
     refresh: bool,
+    processing_start: str | None,
+    processing_stop: str | None,
     venue: str,
     data_dir: Path,
     out_dir: Path,
@@ -555,15 +591,26 @@ def run_all(
     _check_venue(data_dir, venue)
     bbox = tuple(bbox) if bbox else None
 
-    refresh_meta = refresh or not (data_dir / DIST_S1_PARQUET).exists() or not (data_dir / RTC_S1_PARQUET).exists()
-    if refresh_meta:
+    need_dist = refresh or not (data_dir / DIST_S1_PARQUET).exists()
+    need_rtc = refresh or not (data_dir / RTC_S1_PARQUET).exists()
+    if need_dist or need_rtc:
         (data_dir / INPUTS_CHECKPOINT_PARQUET).unlink(missing_ok=True)
         dist_bbox, rtc_bbox = _resolve_bboxes(bbox, data_dir)
-        df_dist = cmr.get_dist_s1_table(start, stop, bbox=dist_bbox, max_workers=cmr_workers, venue=venue)
-        df_dist.to_parquet(data_dir / DIST_S1_PARQUET, compression='zstd')
-        df_rtc = cmr.get_rtc_s1_table_with_lookback(start, stop, bbox=rtc_bbox, max_workers=cmr_workers)
-        df_rtc.to_parquet(data_dir / RTC_S1_PARQUET, compression='zstd')
+        chunks_dir = _rtc_chunks_dir(data_dir, rtc_bbox)
+        if refresh:
+            shutil.rmtree(chunks_dir, ignore_errors=True)
+        if need_dist:
+            df_dist = cmr.get_dist_s1_table(start, stop, bbox=dist_bbox, max_workers=cmr_workers, venue=venue)
+            df_dist.to_parquet(data_dir / DIST_S1_PARQUET, compression='zstd')
+        if need_rtc:
+            df_rtc = cmr.get_rtc_s1_table_with_lookback(
+                start, stop, bbox=rtc_bbox, max_workers=cmr_workers, cache_dir=chunks_dir
+            )
+            _write_rtc(df_rtc, data_dir, chunks_dir)
+            del df_rtc
     df_dist = _load_dist(data_dir)
+    if processing_start or processing_stop:
+        df_dist = _filter_processing_time(df_dist, processing_start, processing_stop)
     if sample_tiles:
         all_tiles = pd.Series(sorted(df_dist.mgrs_tile_id.unique()))
         keep = set(all_tiles.sample(n=min(sample_tiles, len(all_tiles)), random_state=seed))
@@ -590,6 +637,11 @@ def run_all(
         + (f' over {bbox}' if bbox else ' (global)')
         + (f' - sample of {sample_tiles} tiles' if sample_tiles else '')
         + (f' - {venue} venue' if venue != 'PROD' else '')
+        + (
+            f' - processed {processing_start or "start"} to {processing_stop or "now"}'
+            if processing_start or processing_stop
+            else ''
+        )
         + f' - CMR metadata pulled {_pulled_at(data_dir)}'
     )
     title = f'DIST-S1 Production Check {pd.Timestamp(stamp):%Y-%m-%d}'

@@ -1,6 +1,7 @@
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from pathlib import Path
 from warnings import warn
 
 import earthaccess
@@ -138,19 +139,33 @@ def _search_chunked_to_df(
     max_workers: int = 8,
     desc: str = 'CMR chunks',
     cmr_url: str = CMR_GRANULES_URL,
+    cache_dir: Path | None = None,
 ) -> pd.DataFrame:
     """Chunked CMR search where each chunk is converted to a compact DataFrame as it completes.
 
     Peak memory is bounded by the final concatenated table plus one in-flight chunk per worker,
-    never the whole corpus as python dicts.
+    never the whole corpus as python dicts. With `cache_dir`, each chunk is checkpointed to parquet
+    and reused on rerun, so an interrupted download resumes instead of starting over.
     """
     chunks = _date_chunks(start_time, stop_time, chunk_days)
+    if cache_dir is not None:
+        cache_dir.mkdir(parents=True, exist_ok=True)
 
     def _one(chunk: tuple[pd.Timestamp, pd.Timestamp]) -> pd.DataFrame:
+        path = None
+        if cache_dir is not None:
+            path = cache_dir / f'{collection_concept_id}_{chunk[0]:%Y%m%dT%H%M%S}_{chunk[1]:%Y%m%dT%H%M%S}.parquet'
+            if path.exists():
+                return pd.read_parquet(path)
         records = search_granules(
             collection_concept_id, chunk[0], chunk[1], token=token, bbox=bbox, parse_fn=parse_fn, cmr_url=cmr_url
         )
-        return pd.DataFrame(records)
+        df_chunk = pd.DataFrame(records)
+        if path is not None:
+            tmp = path.with_suffix('.tmp')
+            df_chunk.to_parquet(tmp, compression='zstd')
+            tmp.replace(path)
+        return df_chunk
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         with tqdm(total=len(chunks), desc=desc, unit='chunk') as pbar:
@@ -281,6 +296,7 @@ def get_rtc_s1_table(
     bbox: tuple[float, float, float, float] | None = None,
     chunk_days: int = 2,
     max_workers: int = 8,
+    cache_dir: Path | None = None,
 ) -> gpd.GeoDataFrame:
     """Download RTC-S1 granule metadata from CMR into a GeoDataFrame with burst footprints."""
     df = _search_chunked_to_df(
@@ -292,6 +308,7 @@ def get_rtc_s1_table(
         chunk_days=chunk_days,
         max_workers=max_workers,
         desc='RTC-S1 CMR',
+        cache_dir=cache_dir,
     )
     if df.empty:
         raise RuntimeError('No RTC-S1 granules returned; check the time range.')
@@ -326,9 +343,10 @@ def get_rtc_s1_table_with_lookback(
     delta_window_days: int = DELTA_WINDOW_DAYS,
     chunk_days: int = 2,
     max_workers: int = 8,
+    cache_dir: Path | None = None,
 ) -> gpd.GeoDataFrame:
     tables = [
-        get_rtc_s1_table(t0, t1, bbox=bbox, chunk_days=chunk_days, max_workers=max_workers)
+        get_rtc_s1_table(t0, t1, bbox=bbox, chunk_days=chunk_days, max_workers=max_workers, cache_dir=cache_dir)
         for t0, t1 in lookback_date_ranges(start_time, stop_time, delta_lookback_days, delta_window_days)
     ]
     df = pd.concat(tables).drop_duplicates(subset='opera_id')
