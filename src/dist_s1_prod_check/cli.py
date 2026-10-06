@@ -225,17 +225,29 @@ def download_metadata(
     click.echo(f'RTC-S1: {len(df_rtc)} granules -> {data_dir / RTC_S1_PARQUET}')
 
 
+tag_url_template_option = click.option(
+    '--tag-url-template',
+    default=None,
+    help='Read product tags from this location instead of the DAAC URL, formatted per product, e.g. '
+    "'s3://BUCKET/PREFIX/{opera_id}/{opera_id}_GEN-DIST-STATUS.tif' (fields: opera_id, mgrs_tile_id, "
+    'acq_time, processing_time).',
+)
+
+
 @cli.command()
 @click.option('--workers', type=int, default=16, show_default=True)
 @click.option('--sample', type=int, default=0, show_default=True, help='Randomly sample N products (0 = all).')
 @click.option('--seed', type=int, default=42, show_default=True)
+@tag_url_template_option
 @data_dir_option
-def fetch_tags(workers: int, sample: int, seed: int, data_dir: Path) -> None:
+def fetch_tags(workers: int, sample: int, seed: int, tag_url_template: str | None, data_dir: Path) -> None:
     """Fetch product GeoTIFF tags (inputs, prior product) from the DAAC; resumable."""
     df_dist = checks.deduplicate_products(_load_dist(data_dir))
     if sample:
         df_dist = df_dist.sample(n=min(sample, len(df_dist)), random_state=seed)
-    df_tags = tags.fetch_tags_table(df_dist, data_dir / TAGS_PARQUET, max_workers=workers)
+    df_tags = tags.fetch_tags_table(
+        df_dist, data_dir / TAGS_PARQUET, max_workers=workers, url_template=tag_url_template
+    )
     n_err = int((df_tags.error != '').sum())
     click.echo(f'Tags: {len(df_tags)} fetched, {n_err} errors -> {data_dir / TAGS_PARQUET}')
 
@@ -563,6 +575,7 @@ def check_coverage(start: str, stop: str, data_dir: Path, out_dir: Path) -> None
     help='Only check DIST-S1 products processed at or after this time, e.g. 2026-09-24 (isolates one campaign).',
 )
 @click.option('--processing-stop', default=None, help='Only check DIST-S1 products processed before this time.')
+@tag_url_template_option
 @venue_option
 @data_dir_option
 @out_dir_option
@@ -580,6 +593,7 @@ def run_all(
     refresh: bool,
     processing_start: str | None,
     processing_stop: str | None,
+    tag_url_template: str | None,
     venue: str,
     data_dir: Path,
     out_dir: Path,
@@ -628,7 +642,9 @@ def run_all(
     df_tags_products = (
         df_dedup if not sample_inputs else df_dedup.sample(n=min(sample_inputs, len(df_dedup)), random_state=42)
     )
-    df_tags = tags.fetch_tags_table(df_tags_products, data_dir / TAGS_PARQUET, max_workers=workers)
+    df_tags = tags.fetch_tags_table(
+        df_tags_products, data_dir / TAGS_PARQUET, max_workers=workers, url_template=tag_url_template
+    )
     df_tags = df_tags[df_tags.opera_id.isin(df_tags_products.opera_id)]
 
     wkt_map = _wkt_by_tile(_all_tile_geoms())
