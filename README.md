@@ -75,6 +75,19 @@ Requires a `machine uat.urs.earthdata.nasa.gov` entry in `~/.netrc`. Each data d
 (`venue.txt`), since PROD and UAT can hold products with the same ids. If the UAT run did not cover the
 whole globe, pass `--bbox` so the coverage check does not flag every unprocessed tile.
 
+**OPS-POP1 venue** (DIST-S1 products still in the producing cluster's bucket, e.g. before the ASF
+collection is visible to your Earthdata account):
+
+```bash
+dist-s1-prod-check run-all --venue OPS-POP1 --start 2026-01-01 --stop 2026-03-01 \
+    --data-dir data_pop1 --out-dir outputs_pop1
+```
+
+DIST-S1 metadata comes from listing `s3://opera-ops-rs-pop1/products/DIST_S1/{acq YYYY/MM/DD}/`
+anonymously (one request per day, no CMR or Earthdata login), and GeoTIFF tags are read from the
+same bucket over HTTPS. The bucket holds what the cluster produced, which may differ from what was
+delivered to ASF. RTC-S1 inputs still come from PROD CMR.
+
 **Fast iteration on a sample** (reuses all serialized data; seconds-to-minutes per run):
 
 ```bash

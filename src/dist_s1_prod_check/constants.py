@@ -5,10 +5,16 @@ CMR_PAGE_SIZE = 2000
 
 # DIST-S1 products can be checked in ASF's PROD or UAT venue. RTC-S1 inputs are always read from PROD CMR,
 # since the UAT test venue consumes the operational RTC-S1 record.
-VENUES = ('PROD', 'UAT')
+VENUES = ('PROD', 'UAT', 'OPS-POP1')
 DIST_S1_CONCEPT_IDS = {'PROD': DIST_S1_CONCEPT_ID, 'UAT': 'C1275699127-ASF'}
 CMR_GRANULES_URLS = {'PROD': CMR_GRANULES_URL, 'UAT': 'https://cmr.uat.earthdata.nasa.gov/search/granules.umm_json'}
 VENUE_FILE = 'venue.txt'
+
+# Venues read from the producing SDS cluster's public product bucket instead of CMR, for products not yet visible
+# in CMR. The bucket lists products as {prefix}/{acq YYYY/MM/DD}/{opera_id}/ and serves them anonymously over HTTPS.
+DIST_S1_S3_BUCKETS = {'OPS-POP1': 'opera-ops-rs-pop1'}
+DIST_S1_S3_REGION = 'us-west-2'
+DIST_S1_S3_PREFIX = 'products/DIST_S1'
 
 LAYER_URL_MAP = {
     'alert_url': 'GEN-DIST-STATUS',

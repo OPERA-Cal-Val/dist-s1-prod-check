@@ -3,6 +3,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from warnings import warn
+from xml.etree import ElementTree
 
 import earthaccess
 import geopandas as gpd
@@ -28,6 +29,9 @@ from dist_s1_prod_check.constants import (
     DELTA_LOOKBACK_DAYS,
     DELTA_WINDOW_DAYS,
     DIST_S1_CONCEPT_IDS,
+    DIST_S1_S3_BUCKETS,
+    DIST_S1_S3_PREFIX,
+    DIST_S1_S3_REGION,
     DUAL_POLARIZATIONS,
     LAYER_URL_MAP,
     RTC_S1_CONCEPT_ID,
@@ -267,27 +271,86 @@ def get_dist_s1_table(
     max_workers: int = 8,
     venue: str = 'PROD',
 ) -> gpd.GeoDataFrame:
-    """Download DIST-S1 granule metadata from the PROD or UAT CMR into a GeoDataFrame with MGRS tile footprints."""
-    token = token or get_edl_token(venue)
-    df = _search_chunked_to_df(
-        DIST_S1_CONCEPT_IDS[venue],
-        start_time,
-        stop_time,
-        parse_dist_s1_granule,
-        token=token,
-        bbox=bbox,
-        chunk_days=chunk_days,
-        max_workers=max_workers,
-        desc=f'DIST-S1 CMR ({venue})',
-        cmr_url=CMR_GRANULES_URLS[venue],
-    )
+    """Download DIST-S1 granule metadata from CMR (or a venue's S3 bucket) into a GeoDataFrame with MGRS footprints."""
+    if venue in DIST_S1_S3_BUCKETS:
+        df = _list_dist_s1_s3(start_time, stop_time, DIST_S1_S3_BUCKETS[venue], max_workers=max_workers)
+        source = f's3://{DIST_S1_S3_BUCKETS[venue]}/{DIST_S1_S3_PREFIX}'
+    else:
+        token = token or get_edl_token(venue)
+        df = _search_chunked_to_df(
+            DIST_S1_CONCEPT_IDS[venue],
+            start_time,
+            stop_time,
+            parse_dist_s1_granule,
+            token=token,
+            bbox=bbox,
+            chunk_days=chunk_days,
+            max_workers=max_workers,
+            desc=f'DIST-S1 CMR ({venue})',
+            cmr_url=CMR_GRANULES_URLS[venue],
+        )
+        source = 'CMR; check the Earthdata credentials'
     if df.empty:
-        raise RuntimeError('No DIST-S1 granules returned; check the time range and Earthdata credentials.')
+        raise RuntimeError(f'No DIST-S1 granules returned from {source} for the time range.')
     df = df.drop_duplicates(subset='opera_id')
     tile_geoms = get_mgrs_table()[['mgrs_tile_id', 'geometry']]
     df = tile_geoms.merge(df, on='mgrs_tile_id', how='right')
     df = gpd.GeoDataFrame(df, geometry='geometry', crs='EPSG:4326')
+    if venue in DIST_S1_S3_BUCKETS and bbox is not None:
+        # CMR filters spatially server-side; a bucket listing cannot, so keep the tiles touching the bbox here.
+        df = df[df.intersects(box(*bbox))]
     return df.sort_values(['mgrs_tile_id', 'acq_time']).reset_index(drop=True)
+
+
+@retry(stop=stop_after_attempt(10), wait=wait_random_exponential(multiplier=1, max=60), reraise=True)
+def _list_s3_prefixes(bucket: str, prefix: str) -> list[str]:
+    """Sub-prefixes ("directories") directly under `prefix`, via anonymous ListObjectsV2."""
+    url = f'https://{bucket}.s3.{DIST_S1_S3_REGION}.amazonaws.com/'
+    ns = {'s3': 'http://s3.amazonaws.com/doc/2006-03-01/'}
+    params = {'list-type': '2', 'prefix': prefix, 'delimiter': '/'}
+    prefixes = []
+    while True:
+        resp = requests.get(url, params=params, timeout=120)
+        resp.raise_for_status()
+        root = ElementTree.fromstring(resp.content)
+        prefixes += [e.text for e in root.findall('s3:CommonPrefixes/s3:Prefix', ns)]
+        token = root.findtext('s3:NextContinuationToken', namespaces=ns)
+        if not token:
+            return prefixes
+        params['continuation-token'] = token
+
+
+def _list_dist_s1_s3(start_time: DateLike, stop_time: DateLike, bucket: str, max_workers: int = 8) -> pd.DataFrame:
+    """DIST-S1 products acquired in [start_time, stop_time), from the bucket's per-acquisition-day product folders."""
+    start, stop = pd.Timestamp(start_time), pd.Timestamp(stop_time)
+    days = pd.date_range(start.normalize(), (stop - pd.Timedelta(1, 'ns')).normalize(), freq='D')
+    base = f'https://{bucket}.s3.{DIST_S1_S3_REGION}.amazonaws.com/'
+
+    def list_day(day: pd.Timestamp) -> list[dict]:
+        records = []
+        for prefix in _list_s3_prefixes(bucket, f'{DIST_S1_S3_PREFIX}/{day:%Y/%m/%d}/'):
+            opera_id = prefix.rstrip('/').rsplit('/', 1)[-1]
+            tokens = opera_id.split('_')
+            urls = {col: f'{base}{prefix}{opera_id}_{suffix}.tif' for col, suffix in LAYER_URL_MAP.items()}
+            records.append(
+                {
+                    'opera_id': opera_id,
+                    'mgrs_tile_id': tokens[3].lstrip('T'),
+                    'acq_time': pd.Timestamp(tokens[4].rstrip('Z')),
+                    'processing_time': pd.Timestamp(tokens[5].rstrip('Z')),
+                    'sat': tokens[6],
+                    **urls,
+                }
+            )
+        return records
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        per_day = list(tqdm(pool.map(list_day, days), total=len(days), desc=f'DIST-S1 S3 ({bucket})', unit='day'))
+    df = pd.DataFrame([r for day in per_day for r in day])
+    if df.empty:
+        return df
+    in_window = (df.acq_time >= start.tz_localize(None)) & (df.acq_time < stop.tz_localize(None))
+    return df[in_window].reset_index(drop=True)
 
 
 def get_rtc_s1_table(
