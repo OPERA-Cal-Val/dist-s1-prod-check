@@ -8,17 +8,16 @@ Validation checks for the OPERA DIST-S1 production system. Cross-references prod
 
 1. **download-metadata** - DIST-S1 + RTC-S1 granule metadata from CMR into geoparquet tables
    (direct CMR queries, temporally chunked and threaded; no per-product API calls).
-2. **check-duplicates** - DIST-S1 granules sharing the same tile/acquisition. The last-processed
-   granule of a group is taken as the correct one; every other check runs on that granule only.
-3. **check-ordering** - processing order matches acquisition order within each MGRS tile. Each
-   product is compared against the previous acquisition in its tile, and reprocessed acquisitions
-   are excluded (their retained version is processed late by construction, which would otherwise
-   flag both it and everything acquired after it in the tile — a duplicate masquerading as an
-   ordering failure).
+2. **check-duplicates** - DIST-S1 granules for the same pass (same tile, acquisition times within
+   5 minutes). The last-processed granule of a pass is taken as the correct one; every other check
+   runs on that granule only.
+3. **check-ordering** - each product was processed after the previous product in its MGRS tile,
+   using only the last-processed version of each pass. If a pass is reprocessed after the next
+   product was made, that next product is flagged (`prev_n_versions` > 1).
 4. **check-confirmation** - each product's `prior_dist_s1_product` tag points to the previous
-   product in its tile time series.
-5. **check-inputs** - recorded pre/post RTC-S1 inputs match a re-enumeration
-   (`--mode offline` re-enumerates from the local RTC table; `--mode online` hits ASF per product).
+   pass in its tile time series.
+5. **check-inputs** - recorded pre/post RTC-S1 inputs match a re-enumeration, burst pass by burst
+   pass (`--mode offline` re-enumerates from the local RTC table; `--mode online` hits ASF per product).
 6. **check-coverage** - every RTC-S1 pass with baseline imagery has a DIST-S1 product.
 
 Each check writes timestamped CSVs (all results + failures with expected vs. actual) and an
@@ -117,5 +116,11 @@ prefiltered to the check window. Measured: 680 B/row for the RTC table, so the g
   imagery. A burst's baseline must also match its post-image: a `VV+VH` post-image can only be
   paired with `VV+VH` pre-images, and likewise for `HH+HV`. Coverage counts a burst as having a
   baseline only when the lookback windows hold same-polarization acquisitions, and the inputs
-  check reports `Pre RTC baseline polarization mismatch` / `Single polarization input used` for
-  products that violate this.
+  check reports `Pre RTC baseline polarization mismatch` for products that violate this.
+- **Duplicates**: a pass is one MGRS tile (DIST-S1) or one burst (RTC-S1) with acquisition times
+  at most 5 minutes apart, so granule names are not used to find duplicates. One RTC-S1
+  acquisition processed twice can carry acquisition times a second apart
+  ([opera-sds-pcm#1550](https://github.com/nasa/opera-sds-pcm/pull/1550)). Checks use exactly one
+  RTC-S1 per burst pass (the last processed) and one DIST-S1 product per pass (the last
+  processed). The inputs check accepts any copy of an expected burst pass and reports
+  `Duplicate RTC inputs for one burst pass` when a product uses more than one.

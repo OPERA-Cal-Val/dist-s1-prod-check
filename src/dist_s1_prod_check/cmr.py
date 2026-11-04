@@ -5,6 +5,7 @@ from warnings import warn
 
 import earthaccess
 import geopandas as gpd
+import numpy as np
 import pandas as pd
 import requests
 from dist_s1_enumerator.asf import append_pass_data, extract_pass_id, format_polarization
@@ -29,7 +30,7 @@ from dist_s1_prod_check.constants import (
     LAYER_URL_MAP,
     RTC_S1_CONCEPT_ID,
 )
-from dist_s1_prod_check.ids import get_opera_id_trunc, get_track_number
+from dist_s1_prod_check.ids import get_pass_start_times, get_track_number
 
 
 DateLike = str | datetime | pd.Timestamp
@@ -221,9 +222,17 @@ def parse_rtc_s1_granule(item: dict) -> dict:
     }
 
 
-def _dedup_reprocessed(df: pd.DataFrame, processing_col: str) -> pd.DataFrame:
-    df = df.sort_values(['opera_dedup_id', processing_col])
-    return df[~df.duplicated(subset='opera_dedup_id', keep='last')]
+def is_latest_rtc_in_burst_pass(df_rtc: pd.DataFrame) -> np.ndarray:
+    """Mask keeping exactly one RTC-S1 granule per burst and pass: the one processed last.
+
+    Besides reprocessed granules sharing a name prefix, this folds granules of one acquisition whose
+    acquisition times differ by a second (opera-sds-pcm#1550), which granule names alone cannot catch.
+    Only three columns are touched, so a global table is never sorted or copied whole.
+    """
+    df = df_rtc[['jpl_burst_id', 'acq_dt', 'processing_dt']].reset_index(drop=True)
+    df['pass_start'] = get_pass_start_times(df, 'jpl_burst_id', 'acq_dt')
+    superseded = df.sort_values('processing_dt').duplicated(subset=['jpl_burst_id', 'pass_start'], keep='last')
+    return ~superseded.sort_index().to_numpy()
 
 
 def get_dist_s1_table(
@@ -250,7 +259,6 @@ def get_dist_s1_table(
     if df.empty:
         raise RuntimeError('No DIST-S1 granules returned; check the time range and Earthdata credentials.')
     df = df.drop_duplicates(subset='opera_id')
-    df['opera_dedup_id'] = df.opera_id.map(get_opera_id_trunc)
     tile_geoms = get_mgrs_table()[['mgrs_tile_id', 'geometry']]
     df = tile_geoms.merge(df, on='mgrs_tile_id', how='right')
     df = gpd.GeoDataFrame(df, geometry='geometry', crs='EPSG:4326')
@@ -278,8 +286,7 @@ def get_rtc_s1_table(
     if df.empty:
         raise RuntimeError('No RTC-S1 granules returned; check the time range.')
     df = df.drop_duplicates(subset='opera_id')
-    df['opera_dedup_id'] = df.opera_id.map(get_opera_id_trunc)
-    df = _dedup_reprocessed(df, 'processing_dt')
+    df = df[is_latest_rtc_in_burst_pass(df)]
     burst_geoms = get_burst_table(sorted(df.jpl_burst_id.unique()))[['jpl_burst_id', 'geometry']]
     df = burst_geoms.merge(df, on='jpl_burst_id', how='right')
     df = gpd.GeoDataFrame(df, geometry='geometry', crs='EPSG:4326')
@@ -315,7 +322,7 @@ def get_rtc_s1_table_with_lookback(
         for t0, t1 in lookback_date_ranges(start_time, stop_time, delta_lookback_days, delta_window_days)
     ]
     df = pd.concat(tables).drop_duplicates(subset='opera_id')
-    df = _dedup_reprocessed(df, 'processing_dt')
+    df = df[is_latest_rtc_in_burst_pass(df)]
     return (
         gpd.GeoDataFrame(df, geometry='geometry', crs='EPSG:4326')
         .sort_values(['jpl_burst_id', 'acq_dt'])
@@ -327,12 +334,20 @@ def build_rtc_input_frame(df_rtc: gpd.GeoDataFrame, mgrs_tile_ids: list[str] | N
     """Shape an RTC-S1 metadata table into the enumerator's rtc_s1_schema (LUT join adds one row per MGRS tile).
 
     Single-polarization granules are dropped here: DIST-S1 never uses them, as a post-image or in a baseline.
+    Duplicates of a burst pass are dropped next, keeping the last processed, so every check sees exactly
+    one RTC-S1 per burst pass (also for tables downloaded before that rule was applied at download).
     """
     dual_pol = df_rtc.polarizations.isin(DUAL_POLARIZATIONS)
     n_dropped = int((~dual_pol).sum())
     if n_dropped:
         warn(f'Dropping {n_dropped} RTC-S1 granules that are not dual polarization ({", ".join(DUAL_POLARIZATIONS)}).')
-    df = df_rtc[dual_pol & df_rtc.geometry.notna()].copy()
+    valid = (dual_pol & df_rtc.geometry.notna()).to_numpy()
+    keep = valid.copy()
+    keep[valid] = is_latest_rtc_in_burst_pass(df_rtc.loc[valid, ['jpl_burst_id', 'acq_dt', 'processing_dt']])
+    n_superseded = int(valid.sum() - keep.sum())
+    if n_superseded:
+        warn(f'Dropping {n_superseded} RTC-S1 granules duplicating a burst pass; kept the last processed.')
+    df = df_rtc[keep]
     df['acq_dt'] = pd.to_datetime(df.acq_dt, utc=True)
     df['pass_id'] = df.acq_dt.map(extract_pass_id)
     df['url_copol'] = df.url_copol.fillna('')
