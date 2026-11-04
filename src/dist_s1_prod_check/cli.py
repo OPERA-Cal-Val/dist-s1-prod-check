@@ -59,6 +59,11 @@ def _resolve_bboxes(bbox: tuple | None, data_dir: Path) -> tuple[tuple | None, t
     return bbox, rtc_bbox
 
 
+def _pulled_at(data_dir: Path) -> str:
+    modified = pd.Timestamp((data_dir / DIST_S1_PARQUET).stat().st_mtime, unit='s')
+    return f'{modified:%Y-%m-%d %H:%M} UTC'
+
+
 def _load_target_tiles(data_dir: Path) -> list[str] | None:
     tiles_path = data_dir / TARGET_TILES_FILE
     if not tiles_path.exists():
@@ -511,7 +516,9 @@ def run_all(
         f'{start} to {stop}'
         + (f' over {bbox}' if bbox else ' (global)')
         + (f' - sample of {sample_tiles} tiles' if sample_tiles else '')
+        + f' - CMR metadata pulled {_pulled_at(data_dir)}'
     )
+    title = f'DIST-S1 Production Check {pd.Timestamp(stamp):%Y-%m-%d}'
     sections = []
     try:
         for build in (
@@ -535,4 +542,4 @@ def run_all(
             _write_csvs(out_dir, stamp, section_csvs)
     finally:
         if sections:
-            _write_report(out_dir, stamp, _all_tile_geoms(), sections, 'DIST-S1 Production Check', subtitle)
+            _write_report(out_dir, stamp, _all_tile_geoms(), sections, title, subtitle)
