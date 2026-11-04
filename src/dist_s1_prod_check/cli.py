@@ -212,8 +212,8 @@ def _duplicates_section(
     section = report.build_section(
         'duplicates',
         'Duplicates',
-        'DIST-S1 granules sharing the same tile and acquisition time. The last-processed granule of '
-        'each group is taken as the correct one; every other check runs on that granule only.',
+        'DIST-S1 granules for the same pass (same tile, acquisition times within 5 minutes). The last-processed '
+        'granule of each pass is taken as the correct one; every other check runs on that granule only.',
         df_dup,
         len(df_dist),
     )
@@ -223,13 +223,12 @@ def _duplicates_section(
 def _ordering_section(df_dedup: pd.DataFrame, wkt_map: dict[str, str]) -> tuple[list[dict], dict[str, pd.DataFrame]]:
     df_order = checks.check_processing_order(df_dedup)
     df_bad = _append_tile_wkt(df_order[df_order.out_of_order], wkt_map)
-    n_reprocessed = int(df_order.is_reprocessed.sum())
     section = report.build_section(
         'ordering',
         'Processing order',
-        'Products processed before the previous acquisition in their MGRS tile. Excluded from this '
-        f'check: {n_reprocessed} reprocessed acquisitions (see Duplicates - their retained version is '
-        'processed late by construction) and the first evaluated product of each tile.',
+        'Products processed before the previous product in their MGRS tile, using only the last-processed '
+        'version of each pass (see Duplicates). A flag with prev_n_versions > 1 means the previous pass was '
+        'reprocessed after this product was made.',
         df_bad,
         int(df_order.evaluated.sum()),
     )

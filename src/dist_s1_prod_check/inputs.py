@@ -11,11 +11,16 @@ from tqdm import tqdm
 from dist_s1_prod_check.constants import (
     DELTA_LOOKBACK_DAYS,
     DELTA_WINDOW_DAYS,
-    DUAL_POLARIZATIONS,
     MAX_PRE_IMGS_PER_BURST,
     POST_DATE_BUFFER_SECONDS,
 )
-from dist_s1_prod_check.ids import get_acq_timestamp, get_burst_id, get_opera_id_trunc, get_track_number
+from dist_s1_prod_check.ids import (
+    get_acq_timestamp,
+    get_burst_id,
+    get_opera_id_trunc,
+    get_pass_start_times,
+    get_track_number,
+)
 
 
 N_S1_TRACKS = 175
@@ -73,7 +78,7 @@ def _tracks_adjacent(track_numbers: list[int]) -> bool:
 
 
 def _polarization_issues(df_actual: pd.DataFrame, pol_by_opera_id: dict[str, str]) -> list[dict]:
-    """Flag inputs that are single polarization or whose baseline polarization differs from the post-image.
+    """Flag baselines whose polarization differs from their burst's post-image.
 
     A burst's baseline must be built from acquisitions of the same dual polarization as its post-image
     (VV+VH with VV+VH, HH+HV with HH+HV). Inputs absent from `pol_by_opera_id` (outside the RTC table)
@@ -84,12 +89,6 @@ def _polarization_issues(df_actual: pd.DataFrame, pol_by_opera_id: dict[str, str
     if df.empty:
         return []
 
-    issues = []
-    df_single = df[~df.polarizations.isin(DUAL_POLARIZATIONS)]
-    if not df_single.empty:
-        detail = ';'.join(f'{r.opera_id_trunc}={r.polarizations}' for r in df_single.itertuples())
-        issues.append({'issue_type': 'Single polarization input used', 'issue_value': detail})
-
     df_post = df[df.input_category == 'post']
     post_pol_by_burst = dict(zip(df_post.jpl_burst_id, df_post.polarizations))
     df_pre = df[df.input_category == 'pre']
@@ -98,10 +97,10 @@ def _polarization_issues(df_actual: pd.DataFrame, pol_by_opera_id: dict[str, str
         for r in df_pre.itertuples()
         if r.jpl_burst_id in post_pol_by_burst and r.polarizations != post_pol_by_burst[r.jpl_burst_id]
     ]
-    if mismatched:
-        detail = ';'.join(f'{opera_id}={pol} vs post-image {post_pol}' for opera_id, pol, post_pol in mismatched)
-        issues.append({'issue_type': 'Pre RTC baseline polarization mismatch', 'issue_value': detail})
-    return issues
+    if not mismatched:
+        return []
+    detail = ';'.join(f'{opera_id}={pol} vs post-image {post_pol}' for opera_id, pol, post_pol in mismatched)
+    return [{'issue_type': 'Pre RTC baseline polarization mismatch', 'issue_value': detail}]
 
 
 def compare_inputs(
@@ -109,6 +108,11 @@ def compare_inputs(
     df_expected_product: pd.DataFrame,
     pol_by_opera_id: dict[str, str] | None = None,
 ) -> list[dict]:
+    """Compare a product's recorded RTC-S1 inputs with the expected ones, matching inputs by burst pass.
+
+    Any copy of a burst pass satisfies an expected input, since duplicated RTC-S1 granules of one
+    acquisition can differ by a second in their names; using more than one copy is its own issue.
+    """
     issues = []
     if pol_by_opera_id:
         issues.extend(_polarization_issues(df_actual, pol_by_opera_id))
@@ -136,6 +140,18 @@ def compare_inputs(
             }
         )
 
+    cols = ['opera_id_trunc', 'jpl_burst_id', 'acq_dt']
+    df_ids = pd.concat([df_actual[cols], df_expected_product[cols]]).drop_duplicates('opera_id_trunc')
+    df_ids['pass_start'] = get_pass_start_times(df_ids, 'jpl_burst_id', 'acq_dt')
+    pass_by_id = dict(zip(df_ids.opera_id_trunc, zip(df_ids.jpl_burst_id, df_ids.pass_start)))
+
+    actual_passes = df_actual.opera_id_trunc.map(pass_by_id)
+    df_dup = df_actual[actual_passes.duplicated(keep=False)]
+    if not df_dup.empty:
+        issues.append(
+            {'issue_type': 'Duplicate RTC inputs for one burst pass', 'issue_value': ';'.join(df_dup.opera_id_trunc)}
+        )
+
     comparisons = [
         ('Pre RTC IDs expected but not found', exp_pre, df_pre),
         ('Pre RTC IDs found but not expected', df_pre, exp_pre),
@@ -143,7 +159,8 @@ def compare_inputs(
         ('Post RTC IDs found but not expected', df_post, exp_post),
     ]
     for issue_type, df_left, df_right in comparisons:
-        diff = sorted(set(df_left.opera_id_trunc) - set(df_right.opera_id_trunc))
+        right_passes = set(df_right.opera_id_trunc.map(pass_by_id))
+        diff = sorted({opera_id for opera_id in df_left.opera_id_trunc if pass_by_id[opera_id] not in right_passes})
         if diff:
             issues.append({'issue_type': issue_type, 'issue_value': ';'.join(diff)})
 

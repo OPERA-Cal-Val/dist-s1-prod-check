@@ -1,7 +1,12 @@
 import numpy as np
 import pandas as pd
 
-from dist_s1_prod_check.constants import DELTA_LOOKBACK_DAYS, DELTA_WINDOW_DAYS, DUAL_POLARIZATIONS
+from dist_s1_prod_check.constants import (
+    DELTA_LOOKBACK_DAYS,
+    DELTA_WINDOW_DAYS,
+    DUAL_POLARIZATIONS,
+    PASS_TOLERANCE_SECONDS,
+)
 
 
 def _to_utc(series: pd.Series) -> pd.Series:
@@ -58,8 +63,12 @@ def _baseline_burst_counts(
     delta_lookback_days: tuple[int, ...],
     delta_window_days: int,
 ) -> int:
-    """Count post-image bursts with at least one baseline acquisition of the *same* polarization."""
-    n_with_baseline = 0
+    """Count post-image bursts with at least one baseline acquisition of the *same* polarization.
+
+    Each burst is resolved against its own polarization, so one MGRS tile freely mixes VV+VH and
+    HH+HV bursts; only a burst's own baseline is constrained to match its own post-image.
+    """
+    bursts_with_baseline = set()
     for burst_pol in burst_pols:
         acqs = acq_by_burst_pol.get(burst_pol)
         if acqs is None:
@@ -69,22 +78,25 @@ def _baseline_burst_counts(
             stop = post_acq_dt - pd.Timedelta(days=delta)
             start = stop - pd.Timedelta(days=delta_window_days)
             n_pre += np.searchsorted(acqs, stop.to_datetime64()) - np.searchsorted(acqs, start.to_datetime64())
-        n_with_baseline += int(n_pre > 0)
-    return n_with_baseline
+        if n_pre > 0:
+            bursts_with_baseline.add(burst_pol.split('|')[0])
+    return len(bursts_with_baseline)
 
 
 def check_coverage(
     df_expected_groups: pd.DataFrame,
     df_dist_dedup: pd.DataFrame,
     df_rtc_frame: pd.DataFrame | None = None,
-    tolerance_seconds: int = 3600,
+    tolerance_seconds: int = PASS_TOLERANCE_SECONDS,
     delta_lookback_days: tuple[int, ...] = DELTA_LOOKBACK_DAYS,
     delta_window_days: int = DELTA_WINDOW_DAYS,
 ) -> pd.DataFrame:
     """Check every expected MGRS pass has a DIST-S1 product; missing passes are checked for baseline availability.
 
     A burst only counts as having a baseline when the lookback windows hold acquisitions of the same
-    dual polarization as the post-image, matching how the enumerator builds a baseline.
+    dual polarization as the post-image, matching how the enumerator builds a baseline. A product
+    matches a pass only within `tolerance_seconds` (one pass), so it cannot stand in for the pass of
+    another track over the same tile.
     """
     df_dist = df_dist_dedup.copy()
     df_dist['acq_time_utc'] = _to_utc(df_dist.acq_time)
@@ -145,7 +157,7 @@ def check_coverage(
 def check_orphan_products(
     df_expected_groups: pd.DataFrame,
     df_dist_dedup: pd.DataFrame,
-    tolerance_seconds: int = 3600,
+    tolerance_seconds: int = PASS_TOLERANCE_SECONDS,
 ) -> pd.DataFrame:
     """Find DIST-S1 products with no corresponding RTC-S1 pass in the expected groups."""
     df_dist = df_dist_dedup.copy()
