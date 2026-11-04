@@ -12,6 +12,7 @@ LAYER_URL_MAP = {
 DUAL_POLARIZATIONS = ('VV+VH', 'HH+HV')
 
 CUMULUS_RTC_BASE = 'https://cumulus.asf.earthdatacloud.nasa.gov/OPERA/OPERA_L2_RTC-S1/'
+VERTEX_SEARCH_URL = 'https://search.asf.alaska.edu/#/'
 
 DELTA_LOOKBACK_DAYS = (365, 730, 1095)
 MAX_PRE_IMGS_PER_BURST = (4, 3, 3)

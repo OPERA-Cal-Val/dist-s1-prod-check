@@ -185,9 +185,8 @@ document.getElementById('subtitle').textContent = DATA.subtitle;
 
 const map = L.map('map', {worldCopyJump: true}).setView([15, 0], 2);
 L.tileLayer(
-  dark ? 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png'
-       : 'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png',
-  {attribution: '&copy; OpenStreetMap &copy; CARTO', subdomains: 'abcd', maxZoom: 12}
+  `https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_${dark ? 'Dark' : 'Light'}_Gray_Base/MapServer/tile/{z}/{y}/{x}`,
+  {attribution: 'Tiles &copy; Esri &mdash; Esri, DeLorme, NAVTEQ', maxZoom: 12}
 ).addTo(map);
 
 function esc(s) {

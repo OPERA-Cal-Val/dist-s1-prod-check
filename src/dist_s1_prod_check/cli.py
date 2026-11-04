@@ -6,11 +6,24 @@ import pandas as pd
 
 from dist_s1_prod_check import checks, coverage, inputs, report, tags
 from dist_s1_prod_check.constants import (
+    DELTA_LOOKBACK_DAYS,
+    DELTA_WINDOW_DAYS,
     DIST_S1_PARQUET,
     INPUTS_CHECKPOINT_PARQUET,
     RTC_S1_PARQUET,
     TAGS_PARQUET,
     TARGET_TILES_FILE,
+    VERTEX_SEARCH_URL,
+)
+
+
+ASF_LINK_COLUMNS = ['asf_post_rtc_url', 'asf_baseline_rtc_url', 'asf_dist_s1_url']
+COVERAGE_DESCRIPTION = (
+    'RTC-S1 passes with baseline imagery that should have triggered a DIST-S1 product but have none. '
+    'The ASF links open Vertex searches over the tile: asf_post_rtc_url for the post RTC-S1 inputs '
+    '(post date ±1 day), asf_baseline_rtc_url for the first-anniversary baseline RTC-S1 on the same track(s) '
+    f'(post date -{DELTA_LOOKBACK_DAYS[0] + DELTA_WINDOW_DAYS} to -{DELTA_LOOKBACK_DAYS[0]} days), and '
+    'asf_dist_s1_url for any DIST-S1 product of this tile (post date ±1 day).'
 )
 
 
@@ -179,23 +192,47 @@ def _append_tile_wkt(df: pd.DataFrame, wkt_map: dict[str, str]) -> pd.DataFrame:
     return df
 
 
-def _vertex_search_url(wkt: str | None, post_acq_dt: pd.Timestamp) -> str:
-    from urllib.parse import quote
-
+def _vertex_polygon(wkt: str) -> str:
     from shapely import from_wkt, to_wkt
 
-    if not isinstance(wkt, str) or not wkt:
-        return ''
     geom = from_wkt(wkt)
     if geom.geom_type == 'MultiPolygon':
         geom = max(geom.geoms, key=lambda g: g.area)
-    start = (post_acq_dt - pd.Timedelta(days=1)).strftime('%Y-%m-%dT%H:%M:%SZ')
-    end = (post_acq_dt + pd.Timedelta(days=1)).strftime('%Y-%m-%dT%H:%M:%SZ')
-    vertex_wkt = to_wkt(geom, rounding_precision=4).replace(', ', ',').replace('POLYGON (', 'POLYGON(')
-    return (
-        f'https://search.asf.alaska.edu/#/?dataset=OPERA-S1&productTypes=RTC'
-        f'&polygon={quote(vertex_wkt)}&start={start}&end={end}&resultsLoaded=true'
-    )
+    return to_wkt(geom, rounding_precision=4).replace(', ', ',').replace('POLYGON (', 'POLYGON(')
+
+
+def _vertex_url(product_type: str, polygon: str, start: pd.Timestamp, end: pd.Timestamp, **filters: str) -> str:
+    from urllib.parse import quote
+
+    params = {
+        'dataset': 'OPERA-S1',
+        'productTypes': product_type,
+        'polygon': quote(polygon),
+        **filters,
+        'start': f'{start:%Y-%m-%dT%H:%M:%SZ}',
+        'end': f'{end:%Y-%m-%dT%H:%M:%SZ}',
+        'resultsLoaded': 'true',
+    }
+    return VERTEX_SEARCH_URL + '?' + '&'.join(f'{key}={value}' for key, value in params.items())
+
+
+def _asf_search_links(
+    wkt: str | None, mgrs_tile_id: str, track_token: str, post_acq_dt: pd.Timestamp
+) -> dict[str, str]:
+    if not isinstance(wkt, str) or not wkt:
+        return dict.fromkeys(ASF_LINK_COLUMNS, '')
+    polygon = _vertex_polygon(wkt)
+    post_start, post_end = post_acq_dt - pd.Timedelta(days=1), post_acq_dt + pd.Timedelta(days=1)
+    baseline_end = post_acq_dt - pd.Timedelta(days=DELTA_LOOKBACK_DAYS[0])
+    baseline_start = baseline_end - pd.Timedelta(days=DELTA_WINDOW_DAYS)
+    tracks = sorted(int(track) for track in str(track_token).split('_'))
+    return {
+        'asf_post_rtc_url': _vertex_url('RTC', polygon, post_start, post_end),
+        'asf_baseline_rtc_url': _vertex_url(
+            'RTC', polygon, baseline_start, baseline_end, path=f'{tracks[0]}-{tracks[-1]}'
+        ),
+        'asf_dist_s1_url': _vertex_url('DIST-ALERT-S1', polygon, post_start, post_end, tileID=mgrs_tile_id),
+    }
 
 
 def _issue_summary(df_bad: pd.DataFrame) -> dict | None:
@@ -316,9 +353,11 @@ def _coverage_section(
     df_cov = coverage.check_coverage(df_groups, df_dedup, df_rtc_frame=df_frame)
     df_missing = df_cov[~df_cov.product_found & df_cov.missing_product_expected]
     df_missing = _append_tile_wkt(df_missing.drop(columns=['burst_ids', 'burst_pols'], errors='ignore'), wkt_map)
-    df_missing['asf_search_url'] = [
-        _vertex_search_url(row.mgrs_tile_wkt, row.post_acq_dt) for row in df_missing.itertuples()
+    links = [
+        _asf_search_links(row.mgrs_tile_wkt, row.mgrs_tile_id, row.track_token, row.post_acq_dt)
+        for row in df_missing.itertuples()
     ]
+    df_missing = pd.concat([df_missing, pd.DataFrame(links, index=df_missing.index, columns=ASF_LINK_COLUMNS)], axis=1)
     df_orphans = coverage.check_orphan_products(df_groups, df_dedup)
 
     summary = None
@@ -341,7 +380,7 @@ def _coverage_section(
     section = report.build_section(
         'coverage',
         'Coverage',
-        'RTC-S1 passes with baseline imagery that should have triggered a DIST-S1 product but have none.',
+        COVERAGE_DESCRIPTION,
         df_missing,
         len(df_cov),
         summary=summary,
