@@ -1,7 +1,9 @@
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from pathlib import Path
 from warnings import warn
+from xml.etree import ElementTree
 
 import earthaccess
 import geopandas as gpd
@@ -22,10 +24,14 @@ from tqdm import tqdm
 
 from dist_s1_prod_check.constants import (
     CMR_GRANULES_URL,
+    CMR_GRANULES_URLS,
     CMR_PAGE_SIZE,
     DELTA_LOOKBACK_DAYS,
     DELTA_WINDOW_DAYS,
-    DIST_S1_CONCEPT_ID,
+    DIST_S1_CONCEPT_IDS,
+    DIST_S1_S3_BUCKETS,
+    DIST_S1_S3_PREFIX,
+    DIST_S1_S3_REGION,
     DUAL_POLARIZATIONS,
     LAYER_URL_MAP,
     RTC_S1_CONCEPT_ID,
@@ -36,8 +42,8 @@ from dist_s1_prod_check.ids import get_pass_start_times, get_track_number
 DateLike = str | datetime | pd.Timestamp
 
 
-def get_edl_token() -> str:
-    auth = earthaccess.login()
+def get_edl_token(venue: str = 'PROD') -> str:
+    auth = earthaccess.login(system=earthaccess.UAT if venue == 'UAT' else earthaccess.PROD)
     assert auth.authenticated, 'Earthdata login failed; check ~/.netrc or EARTHDATA_* env vars.'
     return auth.token['access_token']
 
@@ -49,8 +55,8 @@ def _fmt_dt(t: DateLike) -> str:
 
 
 @retry(stop=stop_after_attempt(10), wait=wait_random_exponential(multiplier=1, max=60), reraise=True)
-def _get_page(params: dict, headers: dict) -> tuple[list[dict], str | None]:
-    resp = requests.get(CMR_GRANULES_URL, params=params, headers=headers, timeout=120)
+def _get_page(params: dict, headers: dict, cmr_url: str = CMR_GRANULES_URL) -> tuple[list[dict], str | None]:
+    resp = requests.get(cmr_url, params=params, headers=headers, timeout=120)
     resp.raise_for_status()
     return resp.json().get('items', []), resp.headers.get('CMR-Search-After')
 
@@ -63,6 +69,7 @@ def search_granules(
     bbox: tuple[float, float, float, float] | None = None,
     granule_name_pattern: str | None = None,
     parse_fn: Callable[[dict], dict] | None = None,
+    cmr_url: str = CMR_GRANULES_URL,
 ) -> list[dict]:
     """Search CMR granules; with `parse_fn`, each page is parsed as it arrives so raw UMM JSON is never accumulated."""
     params: dict = {
@@ -81,7 +88,7 @@ def search_granules(
     search_after = None
     while True:
         page_headers = headers | ({'CMR-Search-After': search_after} if search_after else {})
-        page_items, search_after = _get_page(params, page_headers)
+        page_items, search_after = _get_page(params, page_headers, cmr_url)
         items.extend(map(parse_fn, page_items) if parse_fn else page_items)
         if not page_items or search_after is None:
             return items
@@ -105,12 +112,15 @@ def search_granules_chunked(
     max_workers: int = 8,
     desc: str = 'CMR chunks',
     parse_fn: Callable[[dict], dict] | None = None,
+    cmr_url: str = CMR_GRANULES_URL,
 ) -> list[dict]:
     """Search CMR granules over a time range by splitting into temporal chunks queried concurrently."""
     chunks = _date_chunks(start_time, stop_time, chunk_days)
 
     def _one(chunk: tuple[pd.Timestamp, pd.Timestamp]) -> list[dict]:
-        return search_granules(collection_concept_id, chunk[0], chunk[1], token=token, bbox=bbox, parse_fn=parse_fn)
+        return search_granules(
+            collection_concept_id, chunk[0], chunk[1], token=token, bbox=bbox, parse_fn=parse_fn, cmr_url=cmr_url
+        )
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         with tqdm(total=len(chunks), desc=desc, unit='chunk') as pbar:
@@ -132,17 +142,34 @@ def _search_chunked_to_df(
     chunk_days: int = 3,
     max_workers: int = 8,
     desc: str = 'CMR chunks',
+    cmr_url: str = CMR_GRANULES_URL,
+    cache_dir: Path | None = None,
 ) -> pd.DataFrame:
     """Chunked CMR search where each chunk is converted to a compact DataFrame as it completes.
 
     Peak memory is bounded by the final concatenated table plus one in-flight chunk per worker,
-    never the whole corpus as python dicts.
+    never the whole corpus as python dicts. With `cache_dir`, each chunk is checkpointed to parquet
+    and reused on rerun, so an interrupted download resumes instead of starting over.
     """
     chunks = _date_chunks(start_time, stop_time, chunk_days)
+    if cache_dir is not None:
+        cache_dir.mkdir(parents=True, exist_ok=True)
 
     def _one(chunk: tuple[pd.Timestamp, pd.Timestamp]) -> pd.DataFrame:
-        records = search_granules(collection_concept_id, chunk[0], chunk[1], token=token, bbox=bbox, parse_fn=parse_fn)
-        return pd.DataFrame(records)
+        path = None
+        if cache_dir is not None:
+            path = cache_dir / f'{collection_concept_id}_{chunk[0]:%Y%m%dT%H%M%S}_{chunk[1]:%Y%m%dT%H%M%S}.parquet'
+            if path.exists():
+                return pd.read_parquet(path)
+        records = search_granules(
+            collection_concept_id, chunk[0], chunk[1], token=token, bbox=bbox, parse_fn=parse_fn, cmr_url=cmr_url
+        )
+        df_chunk = pd.DataFrame(records)
+        if path is not None:
+            tmp = path.with_suffix('.tmp')
+            df_chunk.to_parquet(tmp, compression='zstd')
+            tmp.replace(path)
+        return df_chunk
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         with tqdm(total=len(chunks), desc=desc, unit='chunk') as pbar:
@@ -242,27 +269,88 @@ def get_dist_s1_table(
     token: str | None = None,
     chunk_days: int = 7,
     max_workers: int = 8,
+    venue: str = 'PROD',
 ) -> gpd.GeoDataFrame:
-    """Download DIST-S1 granule metadata from CMR into a GeoDataFrame with MGRS tile footprints."""
-    token = token or get_edl_token()
-    df = _search_chunked_to_df(
-        DIST_S1_CONCEPT_ID,
-        start_time,
-        stop_time,
-        parse_dist_s1_granule,
-        token=token,
-        bbox=bbox,
-        chunk_days=chunk_days,
-        max_workers=max_workers,
-        desc='DIST-S1 CMR',
-    )
+    """Download DIST-S1 granule metadata from CMR (or a venue's S3 bucket) into a GeoDataFrame with MGRS footprints."""
+    if venue in DIST_S1_S3_BUCKETS:
+        df = _list_dist_s1_s3(start_time, stop_time, DIST_S1_S3_BUCKETS[venue], max_workers=max_workers)
+        source = f's3://{DIST_S1_S3_BUCKETS[venue]}/{DIST_S1_S3_PREFIX}'
+    else:
+        token = token or get_edl_token(venue)
+        df = _search_chunked_to_df(
+            DIST_S1_CONCEPT_IDS[venue],
+            start_time,
+            stop_time,
+            parse_dist_s1_granule,
+            token=token,
+            bbox=bbox,
+            chunk_days=chunk_days,
+            max_workers=max_workers,
+            desc=f'DIST-S1 CMR ({venue})',
+            cmr_url=CMR_GRANULES_URLS[venue],
+        )
+        source = 'CMR; check the Earthdata credentials'
     if df.empty:
-        raise RuntimeError('No DIST-S1 granules returned; check the time range and Earthdata credentials.')
+        raise RuntimeError(f'No DIST-S1 granules returned from {source} for the time range.')
     df = df.drop_duplicates(subset='opera_id')
     tile_geoms = get_mgrs_table()[['mgrs_tile_id', 'geometry']]
     df = tile_geoms.merge(df, on='mgrs_tile_id', how='right')
     df = gpd.GeoDataFrame(df, geometry='geometry', crs='EPSG:4326')
+    if venue in DIST_S1_S3_BUCKETS and bbox is not None:
+        # CMR filters spatially server-side; a bucket listing cannot, so keep the tiles touching the bbox here.
+        df = df[df.intersects(box(*bbox))]
     return df.sort_values(['mgrs_tile_id', 'acq_time']).reset_index(drop=True)
+
+
+@retry(stop=stop_after_attempt(10), wait=wait_random_exponential(multiplier=1, max=60), reraise=True)
+def _list_s3_prefixes(bucket: str, prefix: str) -> list[str]:
+    """Sub-prefixes ("directories") directly under `prefix`, via anonymous ListObjectsV2."""
+    url = f'https://{bucket}.s3.{DIST_S1_S3_REGION}.amazonaws.com/'
+    ns = {'s3': 'http://s3.amazonaws.com/doc/2006-03-01/'}
+    params = {'list-type': '2', 'prefix': prefix, 'delimiter': '/'}
+    prefixes = []
+    while True:
+        resp = requests.get(url, params=params, timeout=120)
+        resp.raise_for_status()
+        root = ElementTree.fromstring(resp.content)
+        prefixes += [e.text for e in root.findall('s3:CommonPrefixes/s3:Prefix', ns)]
+        token = root.findtext('s3:NextContinuationToken', namespaces=ns)
+        if not token:
+            return prefixes
+        params['continuation-token'] = token
+
+
+def _list_dist_s1_s3(start_time: DateLike, stop_time: DateLike, bucket: str, max_workers: int = 8) -> pd.DataFrame:
+    """DIST-S1 products acquired in [start_time, stop_time), from the bucket's per-acquisition-day product folders."""
+    start, stop = pd.Timestamp(start_time), pd.Timestamp(stop_time)
+    days = pd.date_range(start.normalize(), (stop - pd.Timedelta(1, 'ns')).normalize(), freq='D')
+    base = f'https://{bucket}.s3.{DIST_S1_S3_REGION}.amazonaws.com/'
+
+    def list_day(day: pd.Timestamp) -> list[dict]:
+        records = []
+        for prefix in _list_s3_prefixes(bucket, f'{DIST_S1_S3_PREFIX}/{day:%Y/%m/%d}/'):
+            opera_id = prefix.rstrip('/').rsplit('/', 1)[-1]
+            tokens = opera_id.split('_')
+            urls = {col: f'{base}{prefix}{opera_id}_{suffix}.tif' for col, suffix in LAYER_URL_MAP.items()}
+            records.append(
+                {
+                    'opera_id': opera_id,
+                    'mgrs_tile_id': tokens[3].lstrip('T'),
+                    'acq_time': pd.Timestamp(tokens[4].rstrip('Z')),
+                    'processing_time': pd.Timestamp(tokens[5].rstrip('Z')),
+                    'sat': tokens[6],
+                    **urls,
+                }
+            )
+        return records
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        per_day = list(tqdm(pool.map(list_day, days), total=len(days), desc=f'DIST-S1 S3 ({bucket})', unit='day'))
+    df = pd.DataFrame([r for day in per_day for r in day])
+    if df.empty:
+        return df
+    in_window = (df.acq_time >= start.tz_localize(None)) & (df.acq_time < stop.tz_localize(None))
+    return df[in_window].reset_index(drop=True)
 
 
 def get_rtc_s1_table(
@@ -271,6 +359,7 @@ def get_rtc_s1_table(
     bbox: tuple[float, float, float, float] | None = None,
     chunk_days: int = 2,
     max_workers: int = 8,
+    cache_dir: Path | None = None,
 ) -> gpd.GeoDataFrame:
     """Download RTC-S1 granule metadata from CMR into a GeoDataFrame with burst footprints."""
     df = _search_chunked_to_df(
@@ -282,6 +371,7 @@ def get_rtc_s1_table(
         chunk_days=chunk_days,
         max_workers=max_workers,
         desc='RTC-S1 CMR',
+        cache_dir=cache_dir,
     )
     if df.empty:
         raise RuntimeError('No RTC-S1 granules returned; check the time range.')
@@ -316,9 +406,10 @@ def get_rtc_s1_table_with_lookback(
     delta_window_days: int = DELTA_WINDOW_DAYS,
     chunk_days: int = 2,
     max_workers: int = 8,
+    cache_dir: Path | None = None,
 ) -> gpd.GeoDataFrame:
     tables = [
-        get_rtc_s1_table(t0, t1, bbox=bbox, chunk_days=chunk_days, max_workers=max_workers)
+        get_rtc_s1_table(t0, t1, bbox=bbox, chunk_days=chunk_days, max_workers=max_workers, cache_dir=cache_dir)
         for t0, t1 in lookback_date_ranges(start_time, stop_time, delta_lookback_days, delta_window_days)
     ]
     df = pd.concat(tables).drop_duplicates(subset='opera_id')

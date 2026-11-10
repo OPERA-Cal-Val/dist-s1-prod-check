@@ -43,7 +43,8 @@ nohup dist-s1-prod-check run-all --start 2026-01-01 --stop 2026-03-01 \
     --data-dir data --out-dir outputs > run_all.log 2>&1 &
 ```
 
-Everything heavy is resumable: metadata tables are only re-downloaded with `--refresh`, tag
+Everything heavy is resumable: metadata tables are only re-downloaded with `--refresh` (the RTC-S1
+download also checkpoints each CMR chunk to `data/rtc_s1_chunks/` until the table is written), tag
 fetching (one DAAC read per product, ~230k globally) caches to `data/dist_s1_tags.parquet`, and
 the offline inputs check checkpoints per tile to `data/inputs_check_results.parquet` — a rerun
 of the same command picks up where it left off. The inputs check runs in `--inputs-workers`
@@ -57,6 +58,35 @@ Over an AOI instead:
 ```bash
 dist-s1-prod-check run-all --start 2026-01-01 --stop 2026-03-01 --bbox -120 34 -118 36
 ```
+
+**UAT venue** (DIST-S1 products delivered to ASF UAT, e.g. from a test-venue replay):
+
+```bash
+dist-s1-prod-check run-all --venue UAT --start 2026-01-01 --stop 2026-03-01 \
+    --processing-start 2026-09-24 --data-dir data_uat --out-dir outputs_uat
+```
+
+A venue can hold several processing campaigns of the same acquisitions (older ones are not deleted).
+`--processing-start` / `--processing-stop` restrict every check to products processed in that range;
+otherwise de-duplication keeps the latest product per tile/acquisition across campaigns.
+
+Only DIST-S1 metadata and GeoTIFF tags come from UAT; RTC-S1 inputs are still read from PROD CMR.
+Requires a `machine uat.urs.earthdata.nasa.gov` entry in `~/.netrc`. Each data dir is tied to one venue
+(`venue.txt`), since PROD and UAT can hold products with the same ids. If the UAT run did not cover the
+whole globe, pass `--bbox` so the coverage check does not flag every unprocessed tile.
+
+**OPS-POP1 venue** (DIST-S1 products still in the producing cluster's bucket, e.g. before the ASF
+collection is visible to your Earthdata account):
+
+```bash
+dist-s1-prod-check run-all --venue OPS-POP1 --start 2026-01-01 --stop 2026-03-01 \
+    --data-dir data_pop1 --out-dir outputs_pop1
+```
+
+DIST-S1 metadata comes from listing `s3://opera-ops-rs-pop1/products/DIST_S1/{acq YYYY/MM/DD}/`
+anonymously (one request per day, no CMR or Earthdata login), and GeoTIFF tags are read from the
+same bucket over HTTPS. The bucket holds what the cluster produced, which may differ from what was
+delivered to ASF. RTC-S1 inputs still come from PROD CMR.
 
 **Fast iteration on a sample** (reuses all serialized data; seconds-to-minutes per run):
 
